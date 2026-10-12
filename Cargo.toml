@@ -1,0 +1,24 @@
+[package]
+name = "wist-config"
+version = "0.1.0" #@gxl:set(version)
+edition = "2024"
+license = "Apache-2.0"
+authors = ["wist Dev Team"]
+description = "Layered TOML config for the wist ecosystem: a main file, a site overlay that only holds ${VAR} references, and a sibling .env holding the values"
+repository = "https://github.com/dayu-sec/wist-config"
+homepage = "https://github.com/dayu-sec/wist-config"
+documentation = "https://docs.rs/wist-config"
+readme = "README.md"
+keywords = ["wist", "config", "toml", "dotenv", "environment"]
+categories = ["config", "development-tools"]
+
+[dependencies]
+toml = "1.1"
+# 结构化错误：`StructError<R>`（本 crate 复用 `wist-error` 的 `ConfigReason`）。
+orion-error = { version = "0.9", features = ["derive", "serde_json"] }
+# 与 wist-gateway / wist-center 共用一套配置错误词表（Io / Parse / Validation / General）。
+wist-error = { version = "0.2" }
+#wist-error = { version = "0.2", path = "../wist-error" }
+
+[lib]
+path = "src/lib.rs"
