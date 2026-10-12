@@ -424,4 +424,144 @@ mod tests {
             ]
         );
     }
+
+    // ─────────── Pass 2: `.env` 解析 / 值写法边角 ───────────
+
+    #[test]
+    fn parse_env_lines_splits_on_the_first_equals_only() {
+        let lines = parse_env_lines("URL=https://c/?a=b\n");
+        assert_eq!(
+            lines,
+            vec![("URL".to_string(), "https://c/?a=b".to_string())]
+        );
+    }
+
+    #[test]
+    fn parse_env_lines_keeps_duplicate_keys_in_order() {
+        let lines = parse_env_lines("A=1\nA=2\n");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1], ("A".to_string(), "2".to_string()));
+    }
+
+    #[test]
+    fn parse_env_lines_treats_single_quotes_literally() {
+        let lines = parse_env_lines("C='a\\\"b'\n");
+        assert_eq!(lines[0].1, "a\\\"b");
+    }
+
+    #[test]
+    fn parse_env_lines_unescapes_double_quotes() {
+        let lines = parse_env_lines("A=\"x\\\"y\"\nB=\"p\\\\q\"\n");
+        assert_eq!(lines[0].1, "x\"y");
+        assert_eq!(lines[1].1, "p\\q");
+    }
+
+    #[test]
+    fn parse_env_lines_keeps_an_unbalanced_quote_literally() {
+        let lines = parse_env_lines("A=\"abc\n");
+        assert_eq!(lines[0].1, "\"abc");
+    }
+
+    #[test]
+    fn strip_optional_quotes_handles_empty_plain_and_single_char() {
+        assert_eq!(strip_optional_quotes("\"\""), "");
+        assert_eq!(strip_optional_quotes("''"), "");
+        assert_eq!(strip_optional_quotes("plain"), "plain");
+        assert_eq!(strip_optional_quotes("\""), "\"");
+    }
+
+    #[test]
+    fn env_value_round_trips_through_the_parser() {
+        for value in ["", "plain", "a b", "a#b", "a'b", "a\"b", "a\\b", "a=b"] {
+            let line = upsert_env_line("", "K", value);
+            let parsed = parse_env_lines(&line);
+            assert_eq!(
+                parsed,
+                vec![("K".to_string(), value.to_string())],
+                "value={value:?}"
+            );
+        }
+    }
+
+    // ─────────── Pass 6: 回写 / upsert / remove ───────────
+
+    #[test]
+    fn upsert_appends_new_keys_and_preserves_existing_order() {
+        let dir = temp_dir("upsert-append");
+        let overlay = write_declaration(&dir, DECLARATION);
+        std::fs::write(values_path(&overlay, &SPEC), "APP_ENDPOINT=https://c\n").expect("env");
+        upsert_declared_vars(&overlay, &SPEC, &[("id", "gw-1")]).expect("upsert");
+        let text = std::fs::read_to_string(values_path(&overlay, &SPEC)).expect("read");
+        assert_eq!(text, "APP_ENDPOINT=https://c\nAPP_ID=gw-1\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_leaves_the_file_untouched_when_nothing_changes() {
+        let dir = temp_dir("upsert-noop");
+        let overlay = write_declaration(&dir, DECLARATION);
+        upsert_declared_vars(&overlay, &SPEC, &[("id", "gw-1")]).expect("first");
+        let path = values_path(&overlay, &SPEC);
+        let before = std::fs::read_to_string(&path).expect("read");
+        upsert_declared_vars(&overlay, &SPEC, &[("id", "gw-1")]).expect("second");
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert_eq!(before, after, "内容不变就不该重写");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_does_not_create_a_file_when_no_key_is_declared() {
+        let dir = temp_dir("upsert-nocreate");
+        let overlay = write_declaration(&dir, DECLARATION);
+        let undeclared =
+            upsert_declared_vars(&overlay, &SPEC, &[("missing", "x")]).expect("upsert");
+        assert_eq!(undeclared, vec!["missing".to_string()]);
+        assert!(
+            !values_path(&overlay, &SPEC).exists(),
+            "无声明键不该建 .env"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn upsert_then_parse_round_trips_tricky_values() {
+        let dir = temp_dir("upsert-roundtrip");
+        let overlay = write_declaration(&dir, "id = \"${APP_ID}\"\nca = \"${APP_CA:-}\"\n");
+        upsert_declared_vars(&overlay, &SPEC, &[("id", "a b#c\"d"), ("ca", "x\\y")])
+            .expect("upsert");
+        let vars =
+            parse_env_lines(&std::fs::read_to_string(values_path(&overlay, &SPEC)).expect("read"))
+                .into_iter()
+                .collect::<HashMap<_, _>>();
+        assert_eq!(vars.get("APP_ID").map(String::as_str), Some("a b#c\"d"));
+        assert_eq!(vars.get("APP_CA").map(String::as_str), Some("x\\y"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_declared_var_is_false_when_the_key_is_not_declared() {
+        let dir = temp_dir("remove-undeclared");
+        let overlay = write_declaration(&dir, DECLARATION);
+        std::fs::write(values_path(&overlay, &SPEC), "OTHER=keep\n").expect("env");
+        assert!(!remove_declared_var(&overlay, &SPEC, "not_a_key").expect("remove"));
+        let text = std::fs::read_to_string(values_path(&overlay, &SPEC)).expect("read");
+        assert_eq!(text, "OTHER=keep\n");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn declared_var_names_ignores_nested_tables() {
+        let dir = temp_dir("declared-nested");
+        let overlay = write_declaration(
+            &dir,
+            "endpoint = \"${APP_ENDPOINT}\"\n\n[server]\naddr = \"${APP_ADDR}\"\n",
+        );
+        let names = declared_var_names(&overlay);
+        assert_eq!(
+            names.get("endpoint").map(String::as_str),
+            Some("APP_ENDPOINT")
+        );
+        assert!(!names.contains_key("server"), "嵌套表不参与回写：{names:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

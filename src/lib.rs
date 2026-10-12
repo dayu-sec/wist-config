@@ -22,7 +22,7 @@ mod layer;
 pub use envfile::{declared_var_names, parse_env_lines, remove_declared_var, upsert_declared_vars};
 pub use layer::{
     LayerSpec, interpolate, interpolate_doc, load_layered_toml, load_vars, merge_disjoint,
-    overlay_path, resolve_overlay_path, values_path,
+    overlay_path, overlay_path_with, resolve_overlay_path, values_path, values_path_with,
 };
 
 pub use wist_error::{ConfigError, ConfigReason, ConfigResult};

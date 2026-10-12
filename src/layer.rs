@@ -31,8 +31,18 @@ pub struct LayerSpec {
 /// 与 [`resolve_overlay_path`] 的区别：本函数**不看文件是否存在** —— 靠它对现场态声明寻址
 /// （做诊断 / 回写时都要算它）。
 pub fn overlay_path(config_path: &Path, spec: &LayerSpec) -> PathBuf {
-    match env_override(spec.overlay_env) {
-        Some(raw) => absolutize(config_path, Path::new(&raw)),
+    overlay_path_with(config_path, spec, env_override(spec.overlay_env).as_deref())
+}
+
+/// [`overlay_path`] 的**显式覆盖**版：`override_path` 直接给（`None` = 主配置同目录的约定文件名；
+/// 相对路径按主配置目录解析）。与进程环境解耦 —— 嵌入方 / 测试可以**确定性地**指定落点。
+pub fn overlay_path_with(
+    config_path: &Path,
+    spec: &LayerSpec,
+    override_path: Option<&str>,
+) -> PathBuf {
+    match override_path {
+        Some(raw) => absolutize(config_path, Path::new(raw)),
         None => config_path.with_file_name(spec.overlay_file),
     }
 }
@@ -46,8 +56,14 @@ pub fn resolve_overlay_path(config_path: &Path, spec: &LayerSpec) -> Option<Path
 /// 现场态**值**（`.env`）的落点：与现场态**声明同目录**（docker-compose 口径：`.env` 挨着声明）；
 /// 可用 [`LayerSpec::values_env`] 显式指定（相对路径按声明目录解析）。
 pub fn values_path(overlay: &Path, spec: &LayerSpec) -> PathBuf {
-    match env_override(spec.values_env) {
-        Some(raw) => absolutize(overlay, Path::new(&raw)),
+    values_path_with(overlay, spec, env_override(spec.values_env).as_deref())
+}
+
+/// [`values_path`] 的**显式覆盖**版：`override_path` 直接给（`None` = 声明同目录的约定文件名；
+/// 相对路径按声明目录解析）。与进程环境解耦 —— 嵌入方 / 测试可以**确定性地**指定落点。
+pub fn values_path_with(overlay: &Path, spec: &LayerSpec, override_path: Option<&str>) -> PathBuf {
+    match override_path {
+        Some(raw) => absolutize(overlay, Path::new(raw)),
         None => overlay.with_file_name(spec.values_file),
     }
 }
@@ -324,15 +340,17 @@ mod tests {
 
     #[test]
     fn the_values_file_lives_beside_the_declaration() {
-        let dir = temp_dir("load-values-path");
-        let overlay = dir.join(SPEC.overlay_file);
-        assert_eq!(values_path(&overlay, &SPEC), dir.join(SPEC.values_file));
-        // 显式指定时跟显式的走。
-        unsafe { std::env::set_var(SPEC.values_env, "/tmp/other.env") };
-        let explicit = values_path(&overlay, &SPEC);
-        unsafe { std::env::remove_var(SPEC.values_env) };
-        assert_eq!(explicit, PathBuf::from("/tmp/other.env"));
-        let _ = std::fs::remove_dir_all(dir);
+        let overlay = Path::new("/srv/app/app-pub.toml");
+        assert_eq!(values_path(overlay, &SPEC), PathBuf::from("/srv/app/.env"));
+        // 显式覆盖时跟显式的走（相对路径按声明目录解析）。
+        assert_eq!(
+            values_path_with(overlay, &SPEC, Some("/tmp/other.env")),
+            PathBuf::from("/tmp/other.env")
+        );
+        assert_eq!(
+            values_path_with(overlay, &SPEC, Some("sub/x.env")),
+            PathBuf::from("/srv/app/sub/x.env")
+        );
     }
 
     #[test]
@@ -377,6 +395,285 @@ mod tests {
         let doc = load_layered_toml(&main, &SPEC).expect("load");
         assert_eq!(doc["server"]["listen"].as_str(), Some("127.0.0.1:80"));
         assert_eq!(doc["agent"]["tenant_id"].as_str(), Some("tenant-1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ─────────── Pass 1: `${VAR}` 插值边角 ───────────
+
+    fn interp(text: &str, dict: &[(&str, &str)]) -> ConfigResult<String> {
+        let vars: HashMap<String, String> = dict
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        interpolate(text, &vars, Path::new("app-pub.toml"), &SPEC)
+    }
+
+    #[test]
+    fn interpolate_replaces_every_reference_in_a_string() {
+        assert_eq!(
+            interp("a=${A}/b=${B}/c", &[("A", "1"), ("B", "2")]).expect("ok"),
+            "a=1/b=2/c"
+        );
+    }
+
+    #[test]
+    fn interpolate_supports_an_empty_default() {
+        assert_eq!(interp("${A:-}", &[]).expect("ok"), "");
+    }
+
+    #[test]
+    fn interpolate_prefers_a_defined_but_empty_value_over_the_default() {
+        assert_eq!(interp("${A:-fallback}", &[("A", "")]).expect("ok"), "");
+    }
+
+    #[test]
+    fn interpolate_default_may_contain_the_separator() {
+        // `:-` 只在**第一次**出现处分隔 —— 默认值里的 `:-` 属于默认值。
+        assert_eq!(interp("${A:-x:-y}", &[]).expect("ok"), "x:-y");
+    }
+
+    #[test]
+    fn interpolate_value_with_a_colon_is_not_mistaken_for_a_default() {
+        assert_eq!(
+            interp("${URL}", &[("URL", "https://c:8443/x")]).expect("ok"),
+            "https://c:8443/x"
+        );
+    }
+
+    #[test]
+    fn interpolate_trims_the_variable_name() {
+        assert_eq!(interp("${ A }", &[("A", "v")]).expect("ok"), "v");
+    }
+
+    #[test]
+    fn interpolate_keeps_a_lone_dollar_sign() {
+        assert_eq!(
+            interp("price $5 and $$ it", &[]).expect("ok"),
+            "price $5 and $$ it"
+        );
+    }
+
+    #[test]
+    fn interpolate_first_brace_closes_the_reference() {
+        // 第一个 `}` 收口；其后的字面量原样保留。
+        assert_eq!(interp("${A}b}", &[("A", "x")]).expect("ok"), "xb}");
+    }
+
+    #[test]
+    fn interpolate_rejects_an_unterminated_reference() {
+        let err = interp("${A", &[]).expect_err("未闭合必须报错");
+        assert!(err.to_string().contains("没有闭合"), "{err}");
+    }
+
+    #[test]
+    fn interpolate_rejects_an_empty_name_without_a_default() {
+        let err = interp("${}", &[]).expect_err("空名必须报错");
+        assert!(err.to_string().contains("未定义的环境变量"), "{err}");
+    }
+
+    #[test]
+    fn interpolate_error_names_the_values_file() {
+        let err = interp("${NOPE}", &[]).expect_err("err");
+        assert!(err.to_string().contains(SPEC.values_file), "{err}");
+    }
+
+    // ─────────── Pass 3: `merge_disjoint` ───────────
+
+    fn toml_of(text: &str) -> toml::Value {
+        toml::from_str(text).expect("toml")
+    }
+
+    #[test]
+    fn merge_disjoint_merges_nested_tables_by_leaf() {
+        let mut base = toml_of("[a]\nx = 1\n[b]\ny = 2\n");
+        let overlay = toml_of("[a]\nz = 3\n[b.c]\nw = 4\n");
+        merge_disjoint(&mut base, overlay, Path::new("app-pub.toml")).expect("merge");
+        assert_eq!(base["a"]["x"].as_integer(), Some(1));
+        assert_eq!(base["a"]["z"].as_integer(), Some(3));
+        assert_eq!(base["b"]["y"].as_integer(), Some(2));
+        assert_eq!(base["b"]["c"]["w"].as_integer(), Some(4));
+    }
+
+    #[test]
+    fn merge_disjoint_adds_a_whole_new_table() {
+        let mut base = toml_of("x = 1\n");
+        let overlay = toml_of("[new]\ny = 2\n");
+        merge_disjoint(&mut base, overlay, Path::new("app-pub.toml")).expect("merge");
+        assert_eq!(base["new"]["y"].as_integer(), Some(2));
+    }
+
+    #[test]
+    fn merge_disjoint_rejects_a_table_where_the_other_has_a_leaf() {
+        let mut base = toml_of("a = 1\n");
+        let overlay = toml_of("[a]\nx = 2\n");
+        let err = merge_disjoint(&mut base, overlay, Path::new("app-pub.toml"))
+            .expect_err("类型不同也算重复");
+        assert!(err.to_string().contains("同一个键只能有一处"), "{err}");
+    }
+
+    #[test]
+    fn merge_disjoint_rejects_a_duplicate_array_leaf() {
+        let mut base = toml_of("a = [1, 2]\n");
+        let overlay = toml_of("a = [3]\n");
+        assert!(
+            merge_disjoint(&mut base, overlay, Path::new("app-pub.toml")).is_err(),
+            "数组是叶子键，重复即拒"
+        );
+    }
+
+    #[test]
+    fn merge_disjoint_requires_both_sides_to_be_tables() {
+        let mut base = toml_of("x = 1\n");
+        let err = merge_disjoint(
+            &mut base,
+            toml::Value::Integer(1),
+            Path::new("app-pub.toml"),
+        )
+        .expect_err("非表 overlay");
+        assert!(err.to_string().contains("都必须是 TOML 表"), "{err}");
+    }
+
+    // ─────────── Pass 4: 路径解析（overlay / values，显式覆盖） ───────────
+
+    #[test]
+    fn overlay_path_default_is_the_sibling_name() {
+        assert_eq!(
+            overlay_path(Path::new("/srv/app/app.toml"), &SPEC),
+            PathBuf::from("/srv/app/app-pub.toml")
+        );
+    }
+
+    #[test]
+    fn overlay_path_override_resolves_relative_to_the_main_dir() {
+        assert_eq!(
+            overlay_path_with(
+                Path::new("/srv/app/app.toml"),
+                &SPEC,
+                Some("custom/pub.toml")
+            ),
+            PathBuf::from("/srv/app/custom/pub.toml")
+        );
+    }
+
+    #[test]
+    fn overlay_path_override_absolute_is_used_verbatim() {
+        assert_eq!(
+            overlay_path_with(
+                Path::new("/srv/app/app.toml"),
+                &SPEC,
+                Some("/etc/wist/pub.toml")
+            ),
+            PathBuf::from("/etc/wist/pub.toml")
+        );
+    }
+
+    #[test]
+    fn resolve_overlay_path_reports_presence() {
+        let dir = temp_dir("resolve");
+        let main = dir.join("app.toml");
+        std::fs::write(&main, "state_dir = \"/s\"\n").expect("write");
+        assert_eq!(resolve_overlay_path(&main, &SPEC), None, "不存在就不用");
+        let overlay = dir.join(SPEC.overlay_file);
+        std::fs::write(&overlay, "x = 1\n").expect("write overlay");
+        assert_eq!(resolve_overlay_path(&main, &SPEC), Some(overlay));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn env_override_reads_and_trims_and_ignores_blank() {
+        // `env_override` 是 `overlay_path` / `values_path` 的 env 入口。
+        // 用**专用**变量名，与并发测试无关（不与共享的 SPEC env 名冲突）。
+        assert_eq!(env_override("WIST_CONFIG_TEST_RAW_ABSENT"), None);
+        unsafe { std::env::set_var("WIST_CONFIG_TEST_RAW_OVERRIDE", "  x  ") };
+        assert_eq!(
+            env_override("WIST_CONFIG_TEST_RAW_OVERRIDE").as_deref(),
+            Some("x")
+        );
+        unsafe { std::env::set_var("WIST_CONFIG_TEST_RAW_OVERRIDE", "   ") };
+        assert_eq!(
+            env_override("WIST_CONFIG_TEST_RAW_OVERRIDE"),
+            None,
+            "全空白 = 未设"
+        );
+        unsafe { std::env::remove_var("WIST_CONFIG_TEST_RAW_OVERRIDE") };
+    }
+
+    // ─────────── Pass 5: `load_layered_toml` 集成 ───────────
+
+    #[test]
+    fn load_interpolates_strings_inside_arrays() {
+        let dir = temp_dir("load-array");
+        let main = write_split(
+            &dir,
+            "state_dir = \"/s\"\n",
+            Some("list = [\"${APP_X}\", \"lit\"]\n"),
+            Some("APP_X=x\n"),
+        );
+        let doc = load_layered_toml(&main, &SPEC).expect("load");
+        let list = doc["list"].as_array().expect("array");
+        assert_eq!(list[0].as_str(), Some("x"));
+        assert_eq!(list[1].as_str(), Some("lit"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_ignores_the_values_file_when_the_overlay_is_absent() {
+        // 没有现场态声明，就不读 `.env` —— 值不能凭空进主配置。
+        let dir = temp_dir("load-values-without-overlay");
+        let main = write_split(
+            &dir,
+            "state_dir = \"/s\"\n",
+            None,
+            Some("APP_ENDPOINT=https://c\n"),
+        );
+        let doc = load_layered_toml(&main, &SPEC).expect("load");
+        assert!(doc.get("endpoint").is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_tolerates_an_empty_overlay_file() {
+        let dir = temp_dir("load-empty-overlay");
+        let main = write_split(&dir, "state_dir = \"/s\"\n", Some(""), None);
+        let doc = load_layered_toml(&main, &SPEC).expect("load");
+        assert_eq!(doc["state_dir"].as_str(), Some("/s"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_uses_quoted_env_values_verbatim() {
+        let dir = temp_dir("load-quoted");
+        let main = write_split(
+            &dir,
+            "state_dir = \"/s\"\n",
+            Some("endpoint = \"${APP_E}\"\n"),
+            Some("APP_E=\"https://c\"\n"),
+        );
+        let doc = load_layered_toml(&main, &SPEC).expect("load");
+        assert_eq!(doc["endpoint"].as_str(), Some("https://c"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_errors_when_the_main_config_is_missing() {
+        let dir = temp_dir("load-missing-main");
+        let err = load_layered_toml(&dir.join("nope.toml"), &SPEC).expect_err("missing main");
+        assert!(err.to_string().contains("读取配置失败"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn load_vars_last_duplicate_wins() {
+        let dir = temp_dir("load-vars-dup");
+        let overlay = dir.join(SPEC.overlay_file);
+        std::fs::write(&overlay, "endpoint = \"${APP_DUP}\"\n").expect("overlay");
+        std::fs::write(
+            values_path(&overlay, &SPEC),
+            "APP_DUP=first\nAPP_DUP=second\n",
+        )
+        .expect("env");
+        let vars = load_vars(&overlay, &SPEC);
+        assert_eq!(vars.get("APP_DUP").map(String::as_str), Some("second"));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

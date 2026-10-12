@@ -39,8 +39,13 @@ let doc = load_layered_toml(std::path::Path::new("gwlinkd.toml"), &SPEC)?;
 - `load_layered_toml(main, spec)` — main + overlay → interpolated + merged `toml::Value`.
 - `upsert_declared_vars(overlay, spec, kv)` / `remove_declared_var(overlay, spec, key)` — write back into the
   values file using the variable names declared in the overlay.
-- Helpers: `overlay_path`, `resolve_overlay_path`, `values_path`, `load_vars`, `interpolate`,
-  `interpolate_doc`, `merge_disjoint`, `declared_var_names`, `parse_env_lines`.
+- Helpers: `overlay_path`, `overlay_path_with`, `resolve_overlay_path`, `values_path`,
+  `values_path_with`, `load_vars`, `interpolate`, `interpolate_doc`, `merge_disjoint`,
+  `declared_var_names`, `parse_env_lines`.
+
+`overlay_path` / `values_path` read an optional override from the process environment. The
+`*_with` variants take the override explicitly (`None` = the conventional sibling name), which keeps
+embedders and tests deterministic without touching the process environment.
 
 ## Interpolation
 
